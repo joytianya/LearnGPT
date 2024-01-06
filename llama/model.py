@@ -2,6 +2,8 @@
 import torch
 import torch.nn as nn
 
+
+
 class LLaMA(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
@@ -22,7 +24,13 @@ class Block(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
         self.rms_1 = RMSNorm(config.n_embd)
-        self.
+        self.attn = CausalSelfAttention(config)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+
 
 class RMSNorm(nn.Module):
     def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
