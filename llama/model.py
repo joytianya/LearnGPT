@@ -7,6 +7,10 @@ import math
 import torch
 import torch.nn as nn
 
+MaskCache = torch.Tensor
+RopeCache = torch.Tensor
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+
 @dataclass
 class LLaMAConfig:
     block_size: int = 2048
@@ -109,9 +113,26 @@ class LLaMA(nn.Module):
 
         return logits
 
+    @classmethod
+    def from_name(cls, name: str) -> Self:
+        return cls(LLaMAConfig.from_name(name))
+    
 
+def build_repo_cache(
+        seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000
+) -> RopeCache:
+    theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, dtype=dtype, device=device) / n_elem))
 
+    seq_idx = torch.arange(seq_len, dtype=dtype, device=device)
 
+    idx_theta = torch.outer(seq_idx, theta).float()
+
+    cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+
+    if dtype in (torch.float16, torch.bfloat16, torch.int8):
+        cache = cache.half()
+    
+    return cache
 
 
 class Block(nn.Module):
