@@ -134,6 +134,7 @@ def build_repo_cache(
     
     return cache
 
+def app
 
 class Block(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
