@@ -1,3 +1,4 @@
+import math
 
 from dataclasses import dataclass
 from typing_extensions import Self
@@ -6,9 +7,10 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 
 MaskCache = torch.Tensor
-RopeCache = torch.Tensor
+RoPECache = torch.Tensor
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 @dataclass
@@ -120,7 +122,7 @@ class LLaMA(nn.Module):
 
 def build_repo_cache(
         seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000
-) -> RopeCache:
+) -> RoPECache:
     theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, dtype=dtype, device=device) / n_elem))
 
     seq_idx = torch.arange(seq_len, dtype=dtype, device=device)
@@ -156,11 +158,85 @@ class Block(nn.Module):
         super().__init__()
         self.rms_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
+        self.rms_2 = RMSNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+        mask: MaskCache,
+        max_seq_length: int,
+        input_pos: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        h, new_kv_cache = self.attn(self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache)
+        x = x + h
+        x = x + self.mlp(self.rms_2(x))
+        return x, new_kv_cache
 
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
+        assert config.n_embd % config.n_head = 0
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.block_size = config.block_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+        mask: MaskCache,
+        max_seq_length: int,
+        input_pos: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
+        head_size = C // self.n_head
+        k = k.view(B, T, self.n_head, head_size)
+        q = q.view(B, T, self.n_head, head_size)
+        v = v.view(B, T, self.n_head, head_size)
+
+        q = apply_rope(q, rope)
+        k = apply_rope(k, rope)
+
+        k = k.transpose(1, 2)
+        q = q.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if kv_cache is not None:
+            cache_k, cache_v = kv_cache
+            if input_pos[-1] >= max_seq_length:
+                input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
+                cache_k = torch.roll(cache_k, -1, dims=2)
+                cache_v = torch.roll(cache_v, -1, dims=2)
+
+            k = cache_k.index_copy(2, input_pos, k)
+            v = cache_v.index_copy(2, input_pos, v)
+            kv_cache = k, v
+
+        # causal self-attention
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(mask[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+
+        # flash attention cuda kernels
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p = 0.0)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        y = self.c_proj(y)
+
+        return y, kv_cache
 
 
 class RMSNorm(nn.Module):
@@ -177,3 +253,18 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
     
+class MLP(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        hidden_dim = 4 * config.n_embd
+        n_hidden = int(2 * hidden_dim / 3)
+        n_hidden = find_multiple(n_hidden, 256)
+
+        self.c_fc1 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
+        x = self.c_proj(x)
+        return x
