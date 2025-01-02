@@ -1,7 +1,7 @@
 # <p align="center">LearnGPT</p>
 
 ## 更新记录
-
+- **20250102:** https://github.com/gencodebyai/simple_gpt
 - **20240104:** 创建项目
 
 ## 简介
